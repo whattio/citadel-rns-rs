@@ -1,6 +1,6 @@
 [package]
 name = "citadel-rns-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Citadel clean-room MIT Rust implementation of the Public Domain Reticulum Wire Protocol (Zero-Port Vault Daemon & Streaming Airlock Proxy)"
@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 axum = "0.7"
 uuid = { version = "1.10", features = ["v4"] }
 futures-util = "0.3"
+flate2 = "1.0"
 
 [[bin]]
 name = "citadel-vault-daemon"

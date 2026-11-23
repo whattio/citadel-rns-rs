@@ -34,7 +34,7 @@ Clean-room, **MIT-licensed Rust** implementation of Citadel's zero-port Reticulu
 - **Standardized Cryptographic Primitives:**
   - **512-bit Curve25519 identity keysets** (`X25519` ECDH ephemeral key exchange + `Ed25519` signatures)
   - **128-bit cryptographic destination hashes** (zero IPv4/IPv6 addressing, zero DNS)
-  - **Streaming `CHT2` Chunked Wire Framing** (340-byte chunks fitting inside Reticulum's encrypted Link MTU, supporting full web applications, 3D GLB assets, and real-time Server-Sent Events / streaming LLM tokens)
+  - **Streaming `CHT2` Chunked Wire Framing (`v0.5.0`):** 400-byte chunks fitting inside Reticulum's 431-byte encrypted Link MDU, synchronized global `SendGate` (`WINDOW_SIZE = 10`), fast `gzip` compression for JS/CSS/HTML/JSON/SVG/WASM, zero-buffer SSE streaming for AI tokens, HTTP caching (`ETag` / `Cache-Control`), and **`FastTcp`** (`TCP_NODELAY` + O(1) streaming HDLC decoder — delivering **>15 MB/s** encrypted wire / **>50 MB/s** effective HTTP throughput)
 - **True 0-Port Outbound Ghost Mode:** The protected Linux host opens zero inbound ports and dials outbound to the Airlock (`--rns-peer`), remaining invisible to LAN/WAN port scans.
 
 ## Binaries

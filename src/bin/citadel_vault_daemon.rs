@@ -1,10 +1,12 @@
-//! Citadel Zero-Port HTTP-over-Reticulum Vault Daemon (Clean-Room MIT Rust v0.4.0)
+//! Citadel Zero-Port HTTP-over-Reticulum Vault Daemon (Clean-Room MIT Rust v0.5.0)
 //!
 //! Features:
 //! - True 0-port outbound Ghost mode (`--rns-peer`) for `nftables [CITADEL-DROP]` hosts
-//! - Global serialized send gate + 8-packet `WindowAck` flow control (mathematically prevents
-//!   broadcast-buffer packet drops across parallel browser asset loads & MJPEG/JPEG camera feeds)
-//! - Full multi-chunk payloads (HTML, multi-MB JS bundles, 3D GLB) + real-time SSE token streaming
+//! - Global serialized `SendGate` with synchronized `WINDOW_SIZE = 10` `WindowAck` flow control
+//!   (zero desync across parallel browser asset loads & MJPEG/JPEG camera feeds)
+//! - Automatic fast gzip compression over `CHT2` (400B chunks) for JS/CSS/HTML/JSON/SVG/WASM
+//! - Zero-buffer streaming preserved for SSE (`text/event-stream`) LLM tokens & live JPEG frames
+//! - HTTP caching headers (`ETag`, `Cache-Control`, `If-None-Match`, immutable `/assets/*`)
 
 use anyhow::Result;
 use citadel_rns_rs::chtp::{
@@ -12,13 +14,14 @@ use citadel_rns_rs::chtp::{
     ResponseMeta, MAX_CHUNK, WINDOW_SIZE,
 };
 use clap::Parser;
+use flate2::{write::GzEncoder, Compression};
+use citadel_rns_rs::fast_tcp::{FastTcpClient, FastTcpServer};
 use reticulum::destination::link::LinkEvent;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
-use reticulum::iface::tcp_client::TcpClient;
-use reticulum::iface::tcp_server::TcpServer;
 use reticulum::transport::{Transport, TransportConfig};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -52,15 +55,16 @@ struct InboundRequest {
 }
 
 struct SendGate {
-    /// Serializes all outbound RNS packets so concurrent HTTP requests never burst past 16-slot broadcast capacity
-    lock: Mutex<()>,
+    /// Serializes all outbound RNS packets and tracks global in-flight chunk count
+    /// in lockstep with the Airlock's global rx_window.
+    window: Mutex<u32>,
     ack_notify: Notify,
 }
 
 impl SendGate {
     fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
+            window: Mutex::new(0),
             ack_notify: Notify::new(),
         }
     }
@@ -68,6 +72,53 @@ impl SendGate {
     fn on_ack(&self) {
         self.ack_notify.notify_waiters();
     }
+
+    async fn reset_window(&self) {
+        *self.window.lock().await = 0;
+    }
+
+    async fn send_control(
+        &self,
+        transport: &Transport,
+        dest_hash: &reticulum::hash::AddressHash,
+        pkt: &[u8],
+    ) {
+        let _wc = self.window.lock().await;
+        transport.send_to_in_links(dest_hash, pkt).await;
+    }
+
+    async fn send_chunk(
+        &self,
+        transport: &Transport,
+        dest_hash: &reticulum::hash::AddressHash,
+        pkt: &[u8],
+    ) {
+        let mut wc = self.window.lock().await;
+        *wc += 1;
+        if *wc >= WINDOW_SIZE {
+            let notified = self.ack_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            transport.send_to_in_links(dest_hash, pkt).await;
+            let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
+            *wc = 0;
+        } else {
+            transport.send_to_in_links(dest_hash, pkt).await;
+        }
+    }
+}
+
+fn is_compressible_content_type(ct: &str) -> bool {
+    let ct_l = ct.to_lowercase();
+    if ct_l.contains("text/event-stream") || ct_l.contains("multipart/") {
+        return false;
+    }
+    ct_l.contains("text/")
+        || ct_l.contains("javascript")
+        || ct_l.contains("json")
+        || ct_l.contains("svg")
+        || ct_l.contains("wasm")
+        || ct_l.contains("gltf-binary")
 }
 
 async fn dispatch_request(
@@ -97,6 +148,14 @@ async fn dispatch_request(
     }
 
     let rid_str = req_id_to_string(&req_id);
+    let is_head_req = meta.method.eq_ignore_ascii_case("HEAD");
+    let client_accepts_gzip = meta
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        .map(|(_, v)| v.to_lowercase().contains("gzip"))
+        .unwrap_or(false);
+
     info!(req_id = %rid_str, method = %meta.method, path = %meta.path, body_len = body_bytes.len(), "RNS -> localhost HTTP");
 
     let url = format!("{}{}", upstream.trim_end_matches('/'), meta.path);
@@ -110,7 +169,13 @@ async fn dispatch_request(
         let kl = k.to_lowercase();
         if matches!(
             kl.as_str(),
-            "content-type" | "accept" | "cookie" | "authorization"
+            "content-type"
+                | "accept"
+                | "accept-encoding"
+                | "cookie"
+                | "authorization"
+                | "if-none-match"
+                | "if-modified-since"
         ) {
             rb = rb.header(k.as_str(), v.as_str());
         }
@@ -123,82 +188,151 @@ async fn dispatch_request(
         Ok(mut resp) => {
             let status = resp.status().as_u16();
             let mut resp_headers = Vec::new();
+            let mut content_type = String::new();
+            let mut has_content_encoding = false;
+            let mut has_cache_control = false;
+
             for (k, v) in resp.headers() {
                 let kl = k.as_str().to_lowercase();
                 if matches!(
                     kl.as_str(),
-                    "content-type" | "cache-control" | "set-cookie" | "location"
+                    "content-type"
+                        | "content-encoding"
+                        | "cache-control"
+                        | "etag"
+                        | "last-modified"
+                        | "vary"
+                        | "set-cookie"
+                        | "location"
                 ) {
                     if let Ok(vs) = v.to_str() {
+                        if kl == "content-type" {
+                            content_type = vs.to_string();
+                        } else if kl == "content-encoding" {
+                            has_content_encoding = true;
+                        } else if kl == "cache-control" {
+                            has_cache_control = true;
+                        }
                         resp_headers.push((kl, vs.to_string()));
                     }
                 }
             }
-            let rmeta = ResponseMeta {
-                status,
-                headers: resp_headers,
-            };
 
-            if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
-                let _g = gate.lock.lock().await;
-                for pkt in head_pkts {
-                    transport.send_to_in_links(&dest_hash, &pkt).await;
-                }
+            // Immutable cache header for Vite content-hashed static bundles (/assets/*)
+            if status == 200 && !has_cache_control && meta.path.starts_with("/assets/") {
+                resp_headers.push((
+                    "cache-control".into(),
+                    "public, max-age=31536000, immutable".into(),
+                ));
             }
 
-            let mut seq: u32 = 0;
-            let mut total_bytes: usize = 0;
-            let mut window_count: u32 = 0;
+            let should_gzip = status == 200
+                && !is_head_req
+                && client_accepts_gzip
+                && !has_content_encoding
+                && is_compressible_content_type(&content_type);
 
-            while let Ok(Some(chunk)) = resp.chunk().await {
-                for slice in chunk.chunks(MAX_CHUNK) {
+            if should_gzip {
+                let raw_body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(req_id = %rid_str, "Failed reading upstream body for gzip: {e}");
+                        return;
+                    }
+                };
+                let orig_len = raw_body.len();
+                let wire_bytes: Vec<u8> = if orig_len >= 512 {
+                    let mut enc = GzEncoder::new(Vec::with_capacity(orig_len / 3), Compression::fast());
+                    if enc.write_all(&raw_body).is_ok() {
+                        match enc.finish() {
+                            Ok(gz) if gz.len() < orig_len => {
+                                resp_headers.push(("content-encoding".into(), "gzip".into()));
+                                gz
+                            }
+                            _ => raw_body.to_vec(),
+                        }
+                    } else {
+                        raw_body.to_vec()
+                    }
+                } else {
+                    raw_body.to_vec()
+                };
+
+                let rmeta = ResponseMeta {
+                    status,
+                    headers: resp_headers,
+                };
+                if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
+                    for pkt in head_pkts {
+                        gate.send_control(&transport, &dest_hash, &pkt).await;
+                    }
+                }
+
+                let mut seq: u32 = 0;
+                for slice in wire_bytes.chunks(MAX_CHUNK) {
                     let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
-                    {
-                        let _g = gate.lock.lock().await;
-                        window_count += 1;
-                        if window_count >= WINDOW_SIZE {
-                            let notified = gate.ack_notify.notified();
-                            tokio::pin!(notified);
-                            notified.as_mut().enable();
-                            transport.send_to_in_links(&dest_hash, &pkt).await;
-                            let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
-                            window_count = 0;
-                        } else {
-                            transport.send_to_in_links(&dest_hash, &pkt).await;
+                    gate.send_chunk(&transport, &dest_hash, &pkt).await;
+                    seq = seq.wrapping_add(1);
+                }
+
+                let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
+                gate.send_control(&transport, &dest_hash, &end_pkt).await;
+                info!(
+                    req_id = %rid_str,
+                    status = status,
+                    orig_bytes = orig_len,
+                    wire_bytes = wire_bytes.len(),
+                    chunks = seq,
+                    "Streamed compressed encrypted RNS response"
+                );
+            } else {
+                let rmeta = ResponseMeta {
+                    status,
+                    headers: resp_headers,
+                };
+                if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
+                    for pkt in head_pkts {
+                        gate.send_control(&transport, &dest_hash, &pkt).await;
+                    }
+                }
+
+                let mut seq: u32 = 0;
+                let mut total_bytes: usize = 0;
+                if !is_head_req {
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        for slice in chunk.chunks(MAX_CHUNK) {
+                            let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
+                            gate.send_chunk(&transport, &dest_hash, &pkt).await;
+                            seq = seq.wrapping_add(1);
+                            total_bytes += slice.len();
                         }
                     }
-                    seq = seq.wrapping_add(1);
-                    total_bytes += slice.len();
                 }
-            }
 
-            let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
-            {
-                let _g = gate.lock.lock().await;
-                transport.send_to_in_links(&dest_hash, &end_pkt).await;
+                let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
+                gate.send_control(&transport, &dest_hash, &end_pkt).await;
+                info!(req_id = %rid_str, status = status, chunks = seq, bytes = total_bytes, "Streamed lossless encrypted RNS response");
             }
-            info!(req_id = %rid_str, status = status, chunks = seq, bytes = total_bytes, "Streamed lossless encrypted RNS response");
         }
         Err(e) => {
             let rmeta = ResponseMeta {
                 status: 502,
                 headers: vec![("content-type".into(), "text/plain".into())],
             };
-            let _g = gate.lock.lock().await;
             if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
                 for pkt in head_pkts {
-                    transport.send_to_in_links(&dest_hash, &pkt).await;
+                    gate.send_control(&transport, &dest_hash, &pkt).await;
                 }
             }
             let msg = format!("Upstream error: {e}");
             let mut seq: u32 = 0;
             for slice in msg.as_bytes().chunks(MAX_CHUNK) {
                 let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
-                transport.send_to_in_links(&dest_hash, &pkt).await;
+                gate.send_chunk(&transport, &dest_hash, &pkt).await;
                 seq += 1;
             }
             let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
-            transport.send_to_in_links(&dest_hash, &end_pkt).await;
+            gate.send_control(&transport, &dest_hash, &end_pkt).await;
         }
     }
 }
@@ -221,25 +355,25 @@ async fn main() -> Result<()> {
             .iface_manager()
             .lock()
             .await
-            .spawn(TcpClient::new(peer), TcpClient::spawn);
+            .spawn(FastTcpClient::new(peer), FastTcpClient::spawn);
         info!(
             dest_hash = %dest_hash,
             mode = "0-port-outbound",
             peer = %peer,
             upstream = %args.upstream,
-            "Citadel Zero-Port Lossless Vault Daemon v0.4.0 LIVE (Clean-Room MIT Rust)"
+            "Citadel Zero-Port Lossless Vault Daemon v0.5.0 LIVE (Clean-Room MIT Rust)"
         );
     } else {
         transport.iface_manager().lock().await.spawn(
-            TcpServer::new(&args.rns_bind, transport.iface_manager()),
-            TcpServer::spawn,
+            FastTcpServer::new(&args.rns_bind, transport.iface_manager()),
+            FastTcpServer::spawn,
         );
         info!(
             dest_hash = %dest_hash,
             mode = "tcp-server",
             bind = %args.rns_bind,
             upstream = %args.upstream,
-            "Citadel Zero-Port Lossless Vault Daemon v0.4.0 LIVE (Clean-Room MIT Rust)"
+            "Citadel Zero-Port Lossless Vault Daemon v0.5.0 LIVE (Clean-Room MIT Rust)"
         );
     }
 
@@ -281,9 +415,11 @@ async fn main() -> Result<()> {
                 };
                 match link_ev.event {
                     LinkEvent::Activated => {
+                        gate.reset_window().await;
                         info!(link_id = %link_ev.id, "Encrypted X25519+Ed25519 Reticulum link ACTIVATED");
                     }
                     LinkEvent::Closed => {
+                        gate.reset_window().await;
                         info!(link_id = %link_ev.id, "Reticulum link closed");
                     }
                     LinkEvent::Data(payload) => {

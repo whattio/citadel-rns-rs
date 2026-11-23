@@ -5,10 +5,12 @@
 //!   Byte   4     : PacketKind (1=ReqHead, 2=ReqChunk, 3=ReqEnd, 4=RespHead, 5=RespChunk, 6=RespEnd)
 //!   Bytes  5..17 : 12-byte ASCII request ID
 //!   Bytes 17..21 : u32 big-endian sequence number
-//!   Bytes 21..   : payload slice (<= MAX_CHUNK = 340 bytes -> max 361 bytes/packet)
+//!   Bytes 21..   : payload slice (<= MAX_CHUNK = 400 bytes -> max 421 bytes/packet <= 431B MDU)
 //!
 //! Supports unlimited payload sizes (HTML, JS bundles, 3D GLB models) AND zero-buffer
 //! Server-Sent Events (SSE) / streaming LLM tokens.
+
+pub mod fast_tcp;
 
 pub mod chtp {
     use anyhow::{bail, Context, Result};
@@ -17,8 +19,8 @@ pub mod chtp {
 
     pub const MAGIC: &[u8; 4] = b"CHT2";
     pub const HEADER_LEN: usize = 21;
-    pub const MAX_CHUNK: usize = 340;
-    pub const WINDOW_SIZE: u32 = 4;
+    pub const MAX_CHUNK: usize = 400;
+    pub const WINDOW_SIZE: u32 = 10;
 
     #[repr(u8)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -16,13 +16,12 @@ use citadel_rns_rs::chtp::{
     decode_packet, encode_json_chunks, encode_packet, req_id_from_str, PacketKind, RequestMeta,
     ResponseMeta, MAX_CHUNK, WINDOW_SIZE,
 };
+use citadel_rns_rs::fast_tcp::{FastTcpClient, FastTcpServer};
 use clap::Parser;
 use futures_util::stream;
 use reticulum::destination::link::LinkEvent;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
-use reticulum::iface::tcp_client::TcpClient;
-use reticulum::iface::tcp_server::TcpServer;
 use reticulum::transport::{Transport, TransportConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -91,7 +90,15 @@ async fn handle_airlock_request(
     let req_id = req_id_from_str(&req_id_str);
 
     let mut fwd_headers = HashMap::new();
-    for key in ["content-type", "accept", "cookie", "authorization"] {
+    for key in [
+        "content-type",
+        "accept",
+        "accept-encoding",
+        "cookie",
+        "authorization",
+        "if-none-match",
+        "if-modified-since",
+    ] {
         if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
             fwd_headers.insert(key.to_string(), val.to_string());
         }
@@ -149,7 +156,8 @@ async fn handle_airlock_request(
             let st = StatusCode::from_u16(resp_meta.status).unwrap_or(StatusCode::OK);
             let mut builder = Response::builder()
                 .status(st)
-                .header("x-citadel-transport", "reticulum-rs-mit-stream");
+                .header("x-citadel-transport", "reticulum-rs-mit-stream")
+                .header("x-citadel-version", "0.5.0");
             for (k, v) in resp_meta.headers {
                 if let (Ok(hk), Ok(hv)) = (
                     HeaderName::from_bytes(k.as_bytes()),
@@ -188,17 +196,17 @@ async fn main() -> Result<()> {
 
     if let Some(ref listen_addr) = args.rns_listen {
         transport.iface_manager().lock().await.spawn(
-            TcpServer::new(listen_addr, transport.iface_manager()),
-            TcpServer::spawn,
+            FastTcpServer::new(listen_addr, transport.iface_manager()),
+            FastTcpServer::spawn,
         );
-        info!(rns_listen = %listen_addr, "Airlock listening for 0-port outbound Ghost Vaults");
+        info!(rns_listen = %listen_addr, "Airlock listening for 0-port outbound Ghost Vaults (FastTcp)");
     } else {
         transport
             .iface_manager()
             .lock()
             .await
-            .spawn(TcpClient::new(&args.rns_peer), TcpClient::spawn);
-        info!(rns_peer = %args.rns_peer, "Airlock dialing Reticulum Vault peer");
+            .spawn(FastTcpClient::new(&args.rns_peer), FastTcpClient::spawn);
+        info!(rns_peer = %args.rns_peer, "Airlock dialing Reticulum Vault peer (FastTcp)");
     }
 
     let target_hash: Arc<RwLock<Option<AddressHash>>> = Arc::new(RwLock::new(None));
@@ -240,9 +248,11 @@ async fn main() -> Result<()> {
                 };
                 match ev.event {
                     LinkEvent::Activated => {
+                        rx_window = 0;
                         info!(link_id = %ev.id, "Encrypted Reticulum Streaming Airlock Link ACTIVATED!");
                     }
                     LinkEvent::Closed => {
+                        rx_window = 0;
                         warn!(link_id = %ev.id, "Reticulum Airlock Link closed — clearing target for auto-reconnect");
                         *th.write().await = None;
                     }
@@ -294,19 +304,6 @@ async fn main() -> Result<()> {
                             }
                             PacketKind::RespEnd => {
                                 map.remove(&pkt.req_id);
-                                rx_window = 0;
-                                if let Some(dest) = *th.read().await {
-                                    let ack = encode_packet(
-                                        PacketKind::WindowAck,
-                                        pkt.req_id,
-                                        pkt.seq,
-                                        &[],
-                                    );
-                                    let t_ack = Arc::clone(&t);
-                                    tokio::spawn(async move {
-                                        t_ack.send_to_out_links(&dest, &ack).await;
-                                    });
-                                }
                             }
                             _ => {}
                         }
