@@ -1,0 +1,30 @@
+[package]
+name = "citadel-rns-rs"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "Citadel clean-room MIT Rust implementation of the Public Domain Reticulum Wire Protocol (Zero-Port Vault Daemon & Streaming Airlock Proxy)"
+
+[dependencies]
+# Clean-room MIT-licensed Rust implementation of the Public Domain Reticulum Wire Protocol
+# (Never bundles post-April-2025 restricted upstream Python RNS packages)
+reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs.git", branch = "main" }
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+axum = "0.7"
+uuid = { version = "1.10", features = ["v4"] }
+futures-util = "0.3"
+
+[[bin]]
+name = "citadel-vault-daemon"
+path = "src/bin/citadel_vault_daemon.rs"
+
+[[bin]]
+name = "citadel-airlock-proxy"
+path = "src/bin/citadel_airlock_proxy.rs"
