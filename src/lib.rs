@@ -10,6 +10,7 @@
 //! Supports unlimited payload sizes (HTML, JS bundles, 3D GLB models) AND zero-buffer
 //! Server-Sent Events (SSE) / streaming LLM tokens.
 
+pub mod client;
 pub mod fast_tcp;
 
 pub mod chtp {

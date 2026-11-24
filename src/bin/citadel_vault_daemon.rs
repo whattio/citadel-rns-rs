@@ -385,13 +385,14 @@ async fn main() -> Result<()> {
     let inflight: Arc<Mutex<HashMap<[u8; 12], InboundRequest>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Periodic Reticulum destination announce
+    // Periodic Reticulum destination announce (includes identity alias in app_data for Ghost Browser discovery)
     {
         let t_ann = Arc::clone(&transport);
         let d_ann = Arc::clone(&dest);
+        let alias_bytes = args.identity_name.clone().into_bytes();
         tokio::spawn(async move {
             loop {
-                t_ann.send_announce(&d_ann, None).await;
+                t_ann.send_announce(&d_ann, Some(&alias_bytes)).await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
