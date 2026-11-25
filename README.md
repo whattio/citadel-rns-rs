@@ -1,10 +1,10 @@
-# `citadel-rns-rs` — Clean-Room MIT Rust Reticulum Transport Stack
+# `citadel-rns-rs` — Application-Layer HTTP/DPP Tunnel Built on `Reticulum-rs` (Experimental Preview)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-brightgreen.svg)](LICENSE)
 [![Live Architecture](https://img.shields.io/badge/Architecture-citadel.ironpass.tech-84cc16.svg)](https://citadel.ironpass.tech/)
-[![Protocol](https://img.shields.io/badge/Wire%20Protocol-Reticulum%20(Public%20Domain)-38bdf8.svg)](https://reticulum.network/)
+[![Protocol](https://img.shields.io/badge/Protocol-Reticulum%20(Public%20Domain%202016)-38bdf8.svg)](https://reticulum.network/)
 
-Clean-room, **MIT-licensed Rust** implementation of Citadel's zero-port Reticulum transport daemons built on the **100% Public Domain Reticulum Wire Protocol** via [`Reticulum-rs`](https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs).
+> **Scope & Status (Experimental Developer Preview):** `citadel-rns-rs` is an **application-layer HTTP/SSE/DPP tunneling daemon and client library (`CHT2`)** built on top of the MIT-licensed Rust [`Reticulum-rs`](https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs) crate. It is **not** a full Reticulum protocol implementation and does not replace Mark Qvist's authoritative Python Reference Implementation ([markqvist/Reticulum](https://github.com/markqvist/Reticulum)). Ongoing engineering work includes formal wire-level interoperability testing against the official Python `RNS` reference node and evaluating community-recognized **Quad4 `Reticulum-Go`** as an optional transport backend. Designed strictly for **EU ESPR / CIRPASS-2 Digital Product Passports, critical-infrastructure resilience, and defensive sovereign privacy** (non-weaponized).
 
 > **Live Architecture & Interactive Non-IP Simulator:** [https://citadel.ironpass.tech/](https://citadel.ironpass.tech/)
 
@@ -67,8 +67,8 @@ RUST_LOG=info ./target/release/citadel-vault-daemon \
 - **IronPass** — Physical & cryptographic hardware identity layer (NXP NTAG 424 DNA NFC silicon, Ed25519 hardware root-of-trust, and physically air-gapped Offline Digital Product Passport vaults).
 
 ## Attribution & Credits
-- **Reticulum Network Stack & Wire Protocol:** Full credit to Danish engineer and cryptographer **Mark Qvist**, inventor of [Reticulum](https://reticulum.network/), for pioneering non-IP cryptographic networking and releasing the Reticulum wire-protocol specification into the public domain.
-- **Rust Wire Implementation:** Built on [`BeechatNetworkSystemsLtd/Reticulum-rs`](https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs) (MIT License).
+- **Reticulum Network Stack & Protocol:** Full credit to Danish engineer and cryptographer **Mark Qvist**, inventor of [Reticulum](https://reticulum.network/) and maintainer of the authoritative Python Reference Implementation ([markqvist/Reticulum](https://github.com/markqvist/Reticulum)), who dedicated the Reticulum Protocol to the public domain in 2016.
+- **Rust Underlying Crate:** Built as an application-layer tunnel on top of [`BeechatNetworkSystemsLtd/Reticulum-rs`](https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs) (MIT License), with formal Python `RNS` wire-interop verification and optional **Quad4 `Reticulum-Go`** transport support on the roadmap.
 
 ## License
 Released under the [MIT License](LICENSE).
