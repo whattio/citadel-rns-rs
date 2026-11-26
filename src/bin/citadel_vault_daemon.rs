@@ -22,7 +22,7 @@ use citadel_rns_rs::security::{
 use reticulum::destination::link::LinkEvent;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
@@ -482,7 +482,16 @@ async fn main() -> Result<()> {
         IfacKey::resolve(args.ifac_key.as_deref(), args.ifac_key_file.as_deref())?.map(Arc::new);
 
     let id = PrivateIdentity::new_from_name(&args.identity_name);
-    let mut transport = Transport::new(TransportConfig::new("citadel-vault", &id));
+    let mut timers = TimerConfig::default();
+    timers.in_link_stale = Duration::from_secs(45);
+    timers.in_link_close = Duration::from_secs(15);
+    timers.out_link_stale = Duration::from_secs(45);
+    timers.out_link_close = Duration::from_secs(15);
+    let mut transport = Transport::new(
+        TransportConfig::new("citadel-vault", &id)
+            .set_reroute_eager(true)
+            .set_timer_config(timers),
+    );
 
     let dest = transport
         .add_destination(id, DestinationName::new("citadel", "http_vault"))

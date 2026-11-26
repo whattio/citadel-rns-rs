@@ -19,9 +19,10 @@ use crate::security::{ClientIdentity, IfacKey};
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
 use reticulum::destination::link::LinkEvent;
+use reticulum::destination::DestinationDesc;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
@@ -55,6 +56,7 @@ pub struct RnsHttpResponse {
 }
 
 struct PeerRecord {
+    desc: DestinationDesc,
     address_hash: AddressHash,
     hash_hex: String,
     alias: String,
@@ -135,7 +137,16 @@ impl CitadelRnsClient {
         client_identity: ClientIdentity,
     ) -> Arc<Self> {
         let id = PrivateIdentity::new_from_name(identity_name);
-        let transport = Arc::new(Transport::new(TransportConfig::new("citadel-ghost-client", &id)));
+        let mut timers = TimerConfig::default();
+        timers.in_link_stale = Duration::from_secs(45);
+        timers.in_link_close = Duration::from_secs(15);
+        timers.out_link_stale = Duration::from_secs(45);
+        timers.out_link_close = Duration::from_secs(15);
+        timers.out_link_keep = Duration::from_secs(5);
+        let tcfg = TransportConfig::new("citadel-ghost-client", &id)
+            .set_reroute_eager(true)
+            .set_timer_config(timers);
+        let transport = Arc::new(Transport::new(tcfg));
         let ifac_fp = ifac.as_ref().map(|k| k.fingerprint().to_string());
 
         if let Some(ref listen_addr) = rns_listen {
@@ -198,7 +209,15 @@ impl CitadelRnsClient {
             let allow = Arc::clone(&client.allow_hashes);
             tokio::spawn(async move {
                 let mut announces = t.recv_announces().await;
-                while let Ok(announce) = announces.recv().await {
+                loop {
+                    let announce = match announces.recv().await {
+                        Ok(a) => a,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Ghost client recv_announces lagged by {n} — continuing");
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
                     let desc = announce.destination.lock().await.desc;
                     let hash_hex = format!("{}", desc.address_hash)
                         .trim_matches('/')
@@ -220,24 +239,30 @@ impl CitadelRnsClient {
                         let mut map = peers.write().await;
                         match map.get_mut(&hash_hex) {
                             Some(rec) => {
+                                rec.desc = desc;
                                 rec.last_seen_ts = now;
                                 if !app_alias.starts_with("node-") {
                                     rec.alias = app_alias.clone();
                                 }
-                                !rec.active
+                                let need = !rec.active
                                     && (rec.link_id.is_none()
-                                        || now.saturating_sub(rec.link_started_ts) >= 5)
+                                        || now.saturating_sub(rec.link_started_ts) >= 5);
+                                if need {
+                                    rec.link_started_ts = now;
+                                }
+                                need
                             }
                             None => {
                                 map.insert(
                                     hash_hex.clone(),
                                     PeerRecord {
+                                        desc,
                                         address_hash: desc.address_hash,
                                         hash_hex: hash_hex.clone(),
                                         alias: app_alias.clone(),
                                         active: false,
                                         link_id: None,
-                                        link_started_ts: 0,
+                                        link_started_ts: now,
                                         requests: 0,
                                         wire_bytes: 0,
                                         logical_bytes: 0,
@@ -251,15 +276,21 @@ impl CitadelRnsClient {
                     };
 
                     if should_link {
-                        info!(dest_hash = %hash_hex, alias = %app_alias, "Establishing encrypted X25519+Ed25519 Reticulum Link...");
-                        let link = t.link(desc).await;
-                        let lid = format!("{}", link.lock().await.id());
-                        let mut map = peers.write().await;
-                        if let Some(rec) = map.get_mut(&hash_hex) {
-                            rec.link_id = Some(lid);
-                            rec.link_started_ts = now_ts();
-                            rec.last_seen_ts = now_ts();
-                        }
+                        let t_bg = Arc::clone(&t);
+                        let peers_bg = Arc::clone(&peers);
+                        let hash_bg = hash_hex.clone();
+                        let alias_bg = app_alias.clone();
+                        tokio::spawn(async move {
+                            info!(dest_hash = %hash_bg, alias = %alias_bg, "Establishing encrypted X25519+Ed25519 Reticulum Link...");
+                            let link = t_bg.link(desc).await;
+                            let lid = format!("{}", link.lock().await.id());
+                            let mut map = peers_bg.write().await;
+                            if let Some(rec) = map.get_mut(&hash_bg) {
+                                rec.link_id = Some(lid);
+                                rec.link_started_ts = now_ts();
+                                rec.last_seen_ts = now_ts();
+                            }
+                        });
                     }
                 }
             });
@@ -303,19 +334,34 @@ impl CitadelRnsClient {
                         }
                         LinkEvent::Closed => {
                             rx_windows.remove(&link_key);
-                            let mut closed_count = 0usize;
+                            let mut to_relink: Vec<(String, String, DestinationDesc)> = Vec::new();
                             {
                                 let mut map = peers.write().await;
                                 for rec in map.values_mut() {
                                     if rec.link_id.as_deref() == Some(link_key.as_str()) {
                                         rec.active = false;
                                         rec.link_id = None;
-                                        rec.link_started_ts = 0;
-                                        closed_count += 1;
+                                        rec.link_started_ts = now_ts();
+                                        to_relink.push((rec.hash_hex.clone(), rec.alias.clone(), rec.desc));
                                     }
                                 }
                             }
-                            warn!(link_id = %ev.id, peers_reset = closed_count, "Reticulum Link closed — will auto-reconnect on next announce");
+                            warn!(link_id = %ev.id, peers_reset = to_relink.len(), "Reticulum Link closed — immediately auto-relinking");
+                            for (hash_bg, alias_bg, desc_bg) in to_relink {
+                                let t_bg = Arc::clone(&t);
+                                let peers_bg = Arc::clone(&peers);
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    info!(dest_hash = %hash_bg, alias = %alias_bg, "Auto-relinking closed Reticulum Link...");
+                                    let link = t_bg.link(desc_bg).await;
+                                    let lid = format!("{}", link.lock().await.id());
+                                    let mut map = peers_bg.write().await;
+                                    if let Some(rec) = map.get_mut(&hash_bg) {
+                                        rec.link_id = Some(lid);
+                                        rec.link_started_ts = now_ts();
+                                    }
+                                });
+                            }
                         }
                         LinkEvent::Data(payload) => {
                             let pkt = match decode_packet(payload.as_slice()) {
@@ -552,14 +598,48 @@ impl CitadelRnsClient {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<RnsHttpResponse> {
-        // Wait briefly (up to 4.5s) if the node announce / X25519 handshake is still activating
-        let wait_deadline = tokio::time::Instant::now() + Duration::from_millis(4500);
+        // Wait briefly (up to 5s) if the node announce / X25519 handshake is still activating,
+        // kicking off an immediate on-demand link if the peer is known but inactive.
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_millis(5000);
         let mut resolved = None;
+        let mut kicked_relink = false;
         loop {
             if let Some((addr, hex, is_active)) = self.resolve_peer(target).await {
                 if is_active {
                     resolved = Some((addr, hex));
                     break;
+                }
+                if !kicked_relink {
+                    let maybe_desc = {
+                        let mut map = self.peers.write().await;
+                        let now = now_ts();
+                        if let Some(rec) = map.get_mut(&hex) {
+                            if rec.link_id.is_none() || now.saturating_sub(rec.link_started_ts) >= 3 {
+                                rec.link_started_ts = now;
+                                Some((rec.desc, rec.alias.clone()))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((desc, alias)) = maybe_desc {
+                        kicked_relink = true;
+                        let t_bg = Arc::clone(&self.transport);
+                        let peers_bg = Arc::clone(&self.peers);
+                        let hex_bg = hex.clone();
+                        tokio::spawn(async move {
+                            info!(dest_hash = %hex_bg, alias = %alias, "On-demand Reticulum Link reconnect...");
+                            let link = t_bg.link(desc).await;
+                            let lid = format!("{}", link.lock().await.id());
+                            let mut map = peers_bg.write().await;
+                            if let Some(rec) = map.get_mut(&hex_bg) {
+                                rec.link_id = Some(lid);
+                                rec.link_started_ts = now_ts();
+                            }
+                        });
+                    }
                 }
                 if tokio::time::Instant::now() >= wait_deadline {
                     resolved = Some((addr, hex));
@@ -568,7 +648,7 @@ impl CitadelRnsClient {
             } else if tokio::time::Instant::now() >= wait_deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
         }
 
         let (dest, dest_hex) = match resolved {
@@ -653,13 +733,34 @@ impl CitadelRnsClient {
             }
             Err(_) => {
                 self.pending.lock().await.remove(&req_id);
-                if let Some(rec) = self.peers.write().await.get_mut(&dest_hex) {
-                    rec.active = false;
-                    rec.link_id = None;
-                    rec.link_started_ts = 0;
+                let relink_info = {
+                    let mut map = self.peers.write().await;
+                    if let Some(rec) = map.get_mut(&dest_hex) {
+                        rec.active = false;
+                        rec.link_id = None;
+                        rec.link_started_ts = now_ts();
+                        Some((rec.desc, rec.alias.clone()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((desc, alias)) = relink_info {
+                    let t_bg = Arc::clone(&self.transport);
+                    let peers_bg = Arc::clone(&self.peers);
+                    let hex_bg = dest_hex.clone();
+                    tokio::spawn(async move {
+                        info!(dest_hash = %hex_bg, alias = %alias, "Re-linking after request timeout...");
+                        let link = t_bg.link(desc).await;
+                        let lid = format!("{}", link.lock().await.id());
+                        let mut map = peers_bg.write().await;
+                        if let Some(rec) = map.get_mut(&hex_bg) {
+                            rec.link_id = Some(lid);
+                            rec.link_started_ts = now_ts();
+                        }
+                    });
                 }
                 Err(anyhow!(
-                    "Reticulum request timed out after {}s ({target}{path_and_query}) — auto-relinking on next announce",
+                    "Reticulum request timed out after {}s ({target}{path_and_query}) — re-linking now, click Retry",
                     timeout.as_secs()
                 ))
             }
