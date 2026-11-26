@@ -88,21 +88,31 @@ impl FastTcpClient {
                     Ok(s)
                 }
                 None => {
-                    let mut tx = tx_channel.lock().await;
+                    let connect_fut = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        TcpStream::connect(addr.clone()),
+                    );
                     tokio::select! {
                         biased;
                         _ = context.cancel.cancelled() => break,
-                        Some(_) = tx.recv() => continue,
-                        res = TcpStream::connect(addr.clone()) => res,
+                        res = connect_fut => match res {
+                            Ok(r) => r,
+                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")),
+                        },
                     }
                 }
             };
 
             let stream = match stream_res {
-                Ok(s) => s,
+                Ok(s) => {
+                    // Drain any stale frames queued while disconnected so fresh handshakes go out immediately
+                    let mut tx = tx_channel.lock().await;
+                    while tx.try_recv().is_ok() {}
+                    s
+                }
                 Err(_) => {
-                    info!(addr = %addr, "fast_tcp: couldn't connect, retrying in 5s");
-                    let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                    info!(addr = %addr, "fast_tcp: couldn't connect, retrying in 2s");
+                    let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
                     loop {
                         let mut tx = tx_channel.lock().await;
                         tokio::select! {

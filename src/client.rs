@@ -59,6 +59,8 @@ struct PeerRecord {
     hash_hex: String,
     alias: String,
     active: bool,
+    link_id: Option<String>,
+    link_started_ts: u64,
     requests: u64,
     wire_bytes: u64,
     logical_bytes: u64,
@@ -83,7 +85,9 @@ pub struct CitadelRnsClient {
     allow_hashes: Arc<HashSet<String>>,
     identity_name: String,
     client_identity: Arc<ClientIdentity>,
+    ifac: Option<Arc<IfacKey>>,
     ifac_fingerprint: Option<String>,
+    rns_peers: Arc<RwLock<Vec<String>>>,
 }
 
 fn now_ts() -> u64 {
@@ -146,14 +150,17 @@ impl CitadelRnsClient {
             );
         }
 
+        let mut initial_peers: Vec<String> = Vec::new();
         for peer in &rns_peers {
-            if !peer.trim().is_empty() {
+            let trimmed = peer.trim();
+            if !trimmed.is_empty() && !initial_peers.iter().any(|p| p == trimmed) {
+                initial_peers.push(trimmed.to_string());
                 transport.iface_manager().lock().await.spawn(
-                    FastTcpClient::new_with_ifac(peer.trim(), ifac.clone()),
+                    FastTcpClient::new_with_ifac(trimmed, ifac.clone()),
                     FastTcpClient::spawn,
                 );
                 info!(
-                    rns_peer = %peer,
+                    rns_peer = %trimmed,
                     ifac = ifac_fp.as_deref().unwrap_or("off"),
                     "Citadel Ghost Client dialing Reticulum peer"
                 );
@@ -179,7 +186,9 @@ impl CitadelRnsClient {
             allow_hashes: Arc::new(allow_set),
             identity_name: identity_name.to_string(),
             client_identity: Arc::new(client_identity),
+            ifac,
             ifac_fingerprint: ifac_fp,
+            rns_peers: Arc::new(RwLock::new(initial_peers)),
         });
 
         // Task 1: Discover Vault announces, enforce optional hash allowlist, and establish X25519+Ed25519 Links
@@ -206,15 +215,18 @@ impl CitadelRnsClient {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| format!("node-{}", &hash_hex[..hash_hex.len().min(8)]));
 
+                    let now = now_ts();
                     let should_link = {
                         let mut map = peers.write().await;
                         match map.get_mut(&hash_hex) {
                             Some(rec) => {
-                                rec.last_seen_ts = now_ts();
+                                rec.last_seen_ts = now;
                                 if !app_alias.starts_with("node-") {
                                     rec.alias = app_alias.clone();
                                 }
                                 !rec.active
+                                    && (rec.link_id.is_none()
+                                        || now.saturating_sub(rec.link_started_ts) >= 5)
                             }
                             None => {
                                 map.insert(
@@ -224,11 +236,13 @@ impl CitadelRnsClient {
                                         hash_hex: hash_hex.clone(),
                                         alias: app_alias.clone(),
                                         active: false,
+                                        link_id: None,
+                                        link_started_ts: 0,
                                         requests: 0,
                                         wire_bytes: 0,
                                         logical_bytes: 0,
                                         chunks_rx: 0,
-                                        last_seen_ts: now_ts(),
+                                        last_seen_ts: now,
                                     },
                                 );
                                 true
@@ -238,10 +252,12 @@ impl CitadelRnsClient {
 
                     if should_link {
                         info!(dest_hash = %hash_hex, alias = %app_alias, "Establishing encrypted X25519+Ed25519 Reticulum Link...");
-                        let _link = t.link(desc).await;
+                        let link = t.link(desc).await;
+                        let lid = format!("{}", link.lock().await.id());
                         let mut map = peers.write().await;
                         if let Some(rec) = map.get_mut(&hash_hex) {
-                            rec.active = true;
+                            rec.link_id = Some(lid);
+                            rec.link_started_ts = now_ts();
                             rec.last_seen_ts = now_ts();
                         }
                     }
@@ -271,19 +287,35 @@ impl CitadelRnsClient {
                     let link_key = format!("{}", ev.id);
                     match ev.event {
                         LinkEvent::Activated => {
-                            rx_windows.insert(link_key, 0);
-                            info!(link_id = %ev.id, "Encrypted Reticulum Link ACTIVATED (in-process)");
+                            rx_windows.insert(link_key.clone(), 0);
+                            let mut matched_alias = String::new();
+                            {
+                                let mut map = peers.write().await;
+                                for rec in map.values_mut() {
+                                    if rec.link_id.as_deref() == Some(link_key.as_str()) {
+                                        rec.active = true;
+                                        rec.last_seen_ts = now_ts();
+                                        matched_alias = rec.alias.clone();
+                                    }
+                                }
+                            }
+                            info!(link_id = %ev.id, alias = %matched_alias, "Encrypted Reticulum Link ACTIVATED (in-process)");
                         }
                         LinkEvent::Closed => {
                             rx_windows.remove(&link_key);
-                            warn!(link_id = %ev.id, "Reticulum Link closed — will auto-reconnect on next announce");
-                            let mut map = peers.write().await;
-                            for rec in map.values_mut() {
-                                // Mark stale links inactive so next 2s announce immediately re-links
-                                if now_ts().saturating_sub(rec.last_seen_ts) >= 2 {
-                                    rec.active = false;
+                            let mut closed_count = 0usize;
+                            {
+                                let mut map = peers.write().await;
+                                for rec in map.values_mut() {
+                                    if rec.link_id.as_deref() == Some(link_key.as_str()) {
+                                        rec.active = false;
+                                        rec.link_id = None;
+                                        rec.link_started_ts = 0;
+                                        closed_count += 1;
+                                    }
                                 }
                             }
+                            warn!(link_id = %ev.id, peers_reset = closed_count, "Reticulum Link closed — will auto-reconnect on next announce");
                         }
                         LinkEvent::Data(payload) => {
                             let pkt = match decode_packet(payload.as_slice()) {
@@ -438,6 +470,35 @@ impl CitadelRnsClient {
         self.ifac_fingerprint.as_deref()
     }
 
+    pub async fn configured_peers(&self) -> Vec<String> {
+        self.rns_peers.read().await.clone()
+    }
+
+    /// Dynamically dial a new outbound Reticulum Relay / Peer at runtime (no restart required).
+    pub async fn connect_peer(&self, addr: &str) -> bool {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        {
+            let mut list = self.rns_peers.write().await;
+            if list.iter().any(|p| p == trimmed) {
+                return false;
+            }
+            list.push(trimmed.to_string());
+        }
+        self.transport.iface_manager().lock().await.spawn(
+            FastTcpClient::new_with_ifac(trimmed, self.ifac.clone()),
+            FastTcpClient::spawn,
+        );
+        info!(
+            rns_peer = %trimmed,
+            ifac = self.ifac_fingerprint.as_deref().unwrap_or("off"),
+            "Citadel Ghost Client dynamically dialing new Reticulum peer"
+        );
+        true
+    }
+
     pub async fn list_peers(&self) -> Vec<PeerSummary> {
         let map = self.peers.read().await;
         let mut list: Vec<PeerSummary> = map
@@ -457,12 +518,12 @@ impl CitadelRnsClient {
         list
     }
 
-    pub async fn resolve_peer(&self, target: &str) -> Option<(AddressHash, String)> {
+    pub async fn resolve_peer(&self, target: &str) -> Option<(AddressHash, String, bool)> {
         let needle = target.trim().to_lowercase();
         let map = self.peers.read().await;
         // 1. Exact 128-bit hash match
         if let Some(rec) = map.get(&needle) {
-            return Some((rec.address_hash, rec.hash_hex.clone()));
+            return Some((rec.address_hash, rec.hash_hex.clone(), rec.active));
         }
         // 2. Prefix hash match or alias match
         for rec in map.values() {
@@ -470,13 +531,13 @@ impl CitadelRnsClient {
                 || rec.hash_hex.starts_with(&needle)
                 || rec.alias.contains(&needle)
             {
-                return Some((rec.address_hash, rec.hash_hex.clone()));
+                return Some((rec.address_hash, rec.hash_hex.clone(), rec.active));
             }
         }
         // 3. Single connected peer convenience alias ("default" / "peer")
         if (needle == "default" || needle == "peer") && map.len() == 1 {
             if let Some(rec) = map.values().next() {
-                return Some((rec.address_hash, rec.hash_hex.clone()));
+                return Some((rec.address_hash, rec.hash_hex.clone(), rec.active));
             }
         }
         None
@@ -491,10 +552,41 @@ impl CitadelRnsClient {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<RnsHttpResponse> {
-        let (dest, dest_hex) = self
-            .resolve_peer(target)
-            .await
-            .ok_or_else(|| anyhow!("No active Reticulum Vault matching '{target}'"))?;
+        // Wait briefly (up to 4.5s) if the node announce / X25519 handshake is still activating
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_millis(4500);
+        let mut resolved = None;
+        loop {
+            if let Some((addr, hex, is_active)) = self.resolve_peer(target).await {
+                if is_active {
+                    resolved = Some((addr, hex));
+                    break;
+                }
+                if tokio::time::Instant::now() >= wait_deadline {
+                    resolved = Some((addr, hex));
+                    break;
+                }
+            } else if tokio::time::Instant::now() >= wait_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        let (dest, dest_hex) = match resolved {
+            Some(pair) => pair,
+            None => {
+                let relays = self.configured_peers().await;
+                let peer_count = self.peers.read().await.len();
+                if relays.is_empty() && peer_count == 0 {
+                    return Err(anyhow!(
+                        "No active Reticulum Vault matching '{target}' (0 relays configured — add a relay in 📡 NODES or pass --rns-peer <host:port>)"
+                    ));
+                }
+                return Err(anyhow!(
+                    "No active Reticulum Vault matching '{target}' ({peer_count} discovered peers across {} relay(s))",
+                    relays.len()
+                ));
+            }
+        };
 
         // Always request gzip on the encrypted wire; we decompress in RAM for WebView
         headers
@@ -561,8 +653,13 @@ impl CitadelRnsClient {
             }
             Err(_) => {
                 self.pending.lock().await.remove(&req_id);
+                if let Some(rec) = self.peers.write().await.get_mut(&dest_hex) {
+                    rec.active = false;
+                    rec.link_id = None;
+                    rec.link_started_ts = 0;
+                }
                 Err(anyhow!(
-                    "Reticulum request timed out after {}s ({target}{path_and_query})",
+                    "Reticulum request timed out after {}s ({target}{path_and_query}) — auto-relinking on next announce",
                     timeout.as_secs()
                 ))
             }
