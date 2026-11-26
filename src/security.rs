@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn ed25519_client_auth_sign_verify_and_reject_tamper() {
         let id = ClientIdentity::from_seed([0x11u8; 32]);
-        let dest = "9229b16d5c1b1a3435d842e9a595e1f2";
+        let dest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let body = b"{\"text\":\"hello over bjarred\"}";
         let mut hdrs = HashMap::new();
         id.sign_request_headers(dest, "POST", "/api/v1/huginn/messages", body, &mut hdrs);
@@ -428,7 +428,7 @@ mod tests {
         // Tampered body must fail
         assert!(verify_request_signature(dest, "POST", "/api/v1/huginn/messages", b"tampered", &hdrs).is_err());
         // Replayed to different vault hash must fail
-        assert!(verify_request_signature("646f21f37516483534ee65dd42f7d08f", "POST", "/api/v1/huginn/messages", body, &hdrs).is_err());
+        assert!(verify_request_signature("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "POST", "/api/v1/huginn/messages", body, &hdrs).is_err());
         // Mutated HTTP path must fail
         assert!(verify_request_signature(dest, "POST", "/api/v1/huginn/admin", body, &hdrs).is_err());
         // Missing headers must fail
