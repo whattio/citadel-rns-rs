@@ -1,11 +1,11 @@
-//! High-throughput Reticulum HDLC-over-TCP interfaces (`FastTcpClient` / `FastTcpServer`).
+//! High-throughput Reticulum HDLC-over-TCP interfaces (`FastTcpClient` / `FastTcpServer`)
+//! with optional Lock 1 **IFAC (Interface Access Code)** dark-network packet masking.
 //!
-//! 100% wire-compatible with Reticulum's standard HDLC-over-TCP framing (`0x7E` / `0x7D` / `0x20`),
-//! while fixing two major throughput bottlenecks in upstream `Reticulum-rs`:
-//! 1. Sets `TCP_NODELAY` (`stream.set_nodelay(true)`) so small `WindowAck` packets never trigger
-//!    Linux's 40 ms TCP Nagle + Delayed-ACK stall.
-//! 2. Uses an O(1)-per-byte streaming HDLC decoder instead of shifting a 1.5 KB buffer per byte.
+//! - When `ifac_key` is `None`: 100% wire-compatible with standard Reticulum HDLC-over-TCP (`0x7E`/`0x7D`/`0x20`).
+//! - When `ifac_key` is `Some`: every frame is authenticated (`HMAC-SHA256`) and XOR-masked with a
+//!   per-packet keystream; unauthenticated scanners/peers are silently dropped before `Packet::deserialize`.
 
+use crate::security::IfacKey;
 use reticulum::buffer::{InputBuffer, OutputBuffer};
 use reticulum::iface::hdlc::Hdlc;
 use reticulum::iface::{Interface, InterfaceContext, InterfaceManager, RxMessage};
@@ -24,6 +24,7 @@ const MAX_FRAME_LEN: usize = 4096;
 pub struct FastTcpClient {
     addr: String,
     stream: Option<TcpStream>,
+    ifac: Option<Arc<IfacKey>>,
 }
 
 impl FastTcpClient {
@@ -31,6 +32,15 @@ impl FastTcpClient {
         Self {
             addr: addr.into(),
             stream: None,
+            ifac: None,
+        }
+    }
+
+    pub fn new_with_ifac<T: Into<String>>(addr: T, ifac: Option<Arc<IfacKey>>) -> Self {
+        Self {
+            addr: addr.into(),
+            stream: None,
+            ifac,
         }
     }
 
@@ -38,12 +48,28 @@ impl FastTcpClient {
         Self {
             addr: addr.into(),
             stream: Some(stream),
+            ifac: None,
+        }
+    }
+
+    pub fn new_from_stream_with_ifac<T: Into<String>>(
+        addr: T,
+        stream: TcpStream,
+        ifac: Option<Arc<IfacKey>>,
+    ) -> Self {
+        Self {
+            addr: addr.into(),
+            stream: Some(stream),
+            ifac,
         }
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
-        let addr = { context.inner.lock().unwrap().addr.clone() };
+        let (addr, ifac) = {
+            let guard = context.inner.lock().unwrap();
+            (guard.addr.clone(), guard.ifac.clone())
+        };
         let iface_address = context.channel.address;
         let mut initial_stream = { context.inner.lock().unwrap().stream.take() };
 
@@ -91,7 +117,11 @@ impl FastTcpClient {
             };
 
             let _ = stream.set_nodelay(true);
-            info!(addr = %addr, "fast_tcp: connected (TCP_NODELAY + O(1) HDLC)");
+            info!(
+                addr = %addr,
+                ifac = ifac.as_ref().map(|k| k.fingerprint()).unwrap_or("off"),
+                "fast_tcp: connected (TCP_NODELAY + O(1) HDLC)"
+            );
 
             let cancel = context.cancel.clone();
             let stop = cancel.child_token();
@@ -100,11 +130,14 @@ impl FastTcpClient {
             let rx_task = {
                 let stop = stop.clone();
                 let rx_channel = rx_channel.clone();
+                let ifac_rx = ifac.clone();
+                let peer_label = addr.clone();
                 tokio::spawn(async move {
                     let mut tcp_buf = [0u8; 16384];
                     let mut frame_buf = Vec::with_capacity(1024);
                     let mut in_frame = false;
                     let mut escape = false;
+                    let mut ifac_bad_frames: u32 = 0;
 
                     loop {
                         tokio::select! {
@@ -120,8 +153,25 @@ impl FastTcpClient {
                                         for &b in &tcp_buf[..n] {
                                             if b == HDLC_FLAG {
                                                 if in_frame && !frame_buf.is_empty() {
-                                                    if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&frame_buf)) {
-                                                        let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                    let decoded_opt = match &ifac_rx {
+                                                        Some(key) => {
+                                                            match key.open_frame(&frame_buf) {
+                                                                Some(plain) => Some(plain),
+                                                                None => {
+                                                                    ifac_bad_frames = ifac_bad_frames.saturating_add(1);
+                                                                    if ifac_bad_frames == 1 || ifac_bad_frames % 25 == 0 {
+                                                                        warn!(peer = %peer_label, dropped = ifac_bad_frames, "[CITADEL-IFAC-DROP] Rejected unauthenticated frame");
+                                                                    }
+                                                                    None
+                                                                }
+                                                            }
+                                                        }
+                                                        None => Some(frame_buf.clone()),
+                                                    };
+                                                    if let Some(plain_buf) = decoded_opt {
+                                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain_buf)) {
+                                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                        }
                                                     }
                                                     frame_buf.clear();
                                                     escape = false;
@@ -159,10 +209,11 @@ impl FastTcpClient {
             let tx_task = {
                 let stop = stop.clone();
                 let tx_channel = tx_channel.clone();
+                let ifac_tx = ifac.clone();
                 tokio::spawn(async move {
-                    const BUF_SZ: usize = core::mem::size_of::<Packet>() * 2;
+                    const BUF_SZ: usize = core::mem::size_of::<Packet>() * 2 + 64;
                     let mut tx_buf = [0u8; BUF_SZ];
-                    let mut hdlc_buf = [0u8; BUF_SZ];
+                    let mut hdlc_buf = [0u8; BUF_SZ * 2];
 
                     loop {
                         if stop.is_cancelled() {
@@ -174,8 +225,16 @@ impl FastTcpClient {
                             Some(message) = tx.recv() => {
                                 let mut out = OutputBuffer::new(&mut tx_buf);
                                 if message.packet.serialize(&mut out).is_ok() {
+                                    let wire_slice_owned;
+                                    let frame_payload: &[u8] = match &ifac_tx {
+                                        Some(key) => {
+                                            wire_slice_owned = key.seal_frame(out.as_slice());
+                                            &wire_slice_owned
+                                        }
+                                        None => out.as_slice(),
+                                    };
                                     let mut hdlc_out = OutputBuffer::new(&mut hdlc_buf);
-                                    if Hdlc::encode(out.as_slice(), &mut hdlc_out).is_ok() {
+                                    if Hdlc::encode(frame_payload, &mut hdlc_out).is_ok() {
                                         if write_stream.write_all(hdlc_out.as_slice()).await.is_err() {
                                             stop.cancel();
                                             break;
@@ -205,6 +264,7 @@ impl Interface for FastTcpClient {
 pub struct FastTcpServer {
     addr: String,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    ifac: Option<Arc<IfacKey>>,
 }
 
 impl FastTcpServer {
@@ -215,12 +275,31 @@ impl FastTcpServer {
         Self {
             addr: addr.into(),
             iface_manager,
+            ifac: None,
+        }
+    }
+
+    pub fn new_with_ifac<T: Into<String>>(
+        addr: T,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+        ifac: Option<Arc<IfacKey>>,
+    ) -> Self {
+        Self {
+            addr: addr.into(),
+            iface_manager,
+            ifac,
         }
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
-        let addr = { context.inner.lock().unwrap().addr.clone() };
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+        let (addr, iface_manager, ifac) = {
+            let guard = context.inner.lock().unwrap();
+            (
+                guard.addr.clone(),
+                guard.iface_manager.clone(),
+                guard.ifac.clone(),
+            )
+        };
         let (_, mut tx_channel) = context.channel.split();
         let cancel = context.cancel.clone();
 
@@ -250,7 +329,11 @@ impl FastTcpServer {
                     continue;
                 }
             };
-            info!(addr = %addr, "fast_tcp_server: listening (TCP_NODELAY + O(1) HDLC)");
+            info!(
+                addr = %addr,
+                ifac = ifac.as_ref().map(|k| k.fingerprint()).unwrap_or("off"),
+                "fast_tcp_server: listening (TCP_NODELAY + O(1) HDLC)"
+            );
 
             loop {
                 tokio::select! {
@@ -261,7 +344,7 @@ impl FastTcpServer {
                             info!(peer = %peer, addr = %addr, "fast_tcp_server: accepted peer");
                             let mut mgr = iface_manager.lock().await;
                             mgr.spawn(
-                                FastTcpClient::new_from_stream(peer.to_string(), stream),
+                                FastTcpClient::new_from_stream_with_ifac(peer.to_string(), stream, ifac.clone()),
                                 FastTcpClient::spawn,
                             );
                         }

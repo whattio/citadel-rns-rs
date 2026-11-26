@@ -3,7 +3,7 @@ name = "citadel-rns-rs"
 version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "Application-layer HTTP/SSE/DPP tunnel, Airlock proxy & blind Reticulum Transport Relay built on MIT Reticulum-rs (experimental preview)"
+description = "Citadel clean-room MIT Rust implementation of the Public Domain Reticulum Wire Protocol (Zero-Port Vault Daemon & Streaming Airlock Proxy)"
 
 [dependencies]
 # Clean-room MIT-licensed Rust implementation of the Public Domain Reticulum Wire Protocol
@@ -21,6 +21,10 @@ axum = "0.7"
 uuid = { version = "1.10", features = ["v4"] }
 futures-util = "0.3"
 flate2 = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [[bin]]
 name = "citadel-vault-daemon"

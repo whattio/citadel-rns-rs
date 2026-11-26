@@ -12,6 +12,7 @@
 
 pub mod client;
 pub mod fast_tcp;
+pub mod security;
 
 pub mod chtp {
     use anyhow::{bail, Context, Result};

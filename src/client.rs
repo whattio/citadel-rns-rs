@@ -15,6 +15,7 @@ use crate::chtp::{
     ResponseMeta, MAX_CHUNK, WINDOW_SIZE,
 };
 use crate::fast_tcp::{FastTcpClient, FastTcpServer};
+use crate::security::{ClientIdentity, IfacKey};
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
 use reticulum::destination::link::LinkEvent;
@@ -81,6 +82,8 @@ pub struct CitadelRnsClient {
     pending: Arc<Mutex<HashMap<[u8; 12], PendingFetch>>>,
     allow_hashes: Arc<HashSet<String>>,
     identity_name: String,
+    client_identity: Arc<ClientIdentity>,
+    ifac_fingerprint: Option<String>,
 }
 
 fn now_ts() -> u64 {
@@ -106,25 +109,54 @@ impl CitadelRnsClient {
         rns_peers: Vec<String>,
         allow_hashes: Vec<String>,
     ) -> Arc<Self> {
+        let client_id = ClientIdentity::load_or_create(None)
+            .unwrap_or_else(|_| ClientIdentity::from_seed([0x42u8; 32]));
+        Self::start_with_security(
+            identity_name,
+            rns_listen,
+            rns_peers,
+            allow_hashes,
+            None,
+            client_id,
+        )
+        .await
+    }
+
+    pub async fn start_with_security(
+        identity_name: &str,
+        rns_listen: Option<String>,
+        rns_peers: Vec<String>,
+        allow_hashes: Vec<String>,
+        ifac: Option<Arc<IfacKey>>,
+        client_identity: ClientIdentity,
+    ) -> Arc<Self> {
         let id = PrivateIdentity::new_from_name(identity_name);
         let transport = Arc::new(Transport::new(TransportConfig::new("citadel-ghost-client", &id)));
+        let ifac_fp = ifac.as_ref().map(|k| k.fingerprint().to_string());
 
         if let Some(ref listen_addr) = rns_listen {
             transport.iface_manager().lock().await.spawn(
-                FastTcpServer::new(listen_addr, transport.iface_manager()),
+                FastTcpServer::new_with_ifac(listen_addr, transport.iface_manager(), ifac.clone()),
                 FastTcpServer::spawn,
             );
-            info!(rns_listen = %listen_addr, "Citadel Ghost Client listening for 0-port outbound Debian/Linux Vaults");
+            info!(
+                rns_listen = %listen_addr,
+                ifac = ifac_fp.as_deref().unwrap_or("off"),
+                "Citadel Ghost Client listening for 0-port outbound Debian/Linux Vaults"
+            );
         }
 
         for peer in &rns_peers {
             if !peer.trim().is_empty() {
-                transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(FastTcpClient::new(peer.trim()), FastTcpClient::spawn);
-                info!(rns_peer = %peer, "Citadel Ghost Client dialing Reticulum peer");
+                transport.iface_manager().lock().await.spawn(
+                    FastTcpClient::new_with_ifac(peer.trim(), ifac.clone()),
+                    FastTcpClient::spawn,
+                );
+                info!(
+                    rns_peer = %peer,
+                    ifac = ifac_fp.as_deref().unwrap_or("off"),
+                    "Citadel Ghost Client dialing Reticulum peer"
+                );
             }
         }
 
@@ -134,12 +166,20 @@ impl CitadelRnsClient {
             .filter(|h| !h.is_empty())
             .collect();
 
+        info!(
+            client_id = %client_identity.client_id(),
+            ifac = ifac_fp.as_deref().unwrap_or("off"),
+            "Citadel Ghost Client Ed25519 Mutual Auth identity ready"
+        );
+
         let client = Arc::new(Self {
             transport: Arc::clone(&transport),
             peers: Arc::new(RwLock::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             allow_hashes: Arc::new(allow_set),
             identity_name: identity_name.to_string(),
+            client_identity: Arc::new(client_identity),
+            ifac_fingerprint: ifac_fp,
         });
 
         // Task 1: Discover Vault announces, enforce optional hash allowlist, and establish X25519+Ed25519 Links
@@ -386,6 +426,18 @@ impl CitadelRnsClient {
         &self.identity_name
     }
 
+    pub fn client_id(&self) -> &str {
+        self.client_identity.client_id()
+    }
+
+    pub fn client_pubkey_hex(&self) -> &str {
+        self.client_identity.pubkey_hex()
+    }
+
+    pub fn ifac_fingerprint(&self) -> Option<&str> {
+        self.ifac_fingerprint.as_deref()
+    }
+
     pub async fn list_peers(&self) -> Vec<PeerSummary> {
         let map = self.peers.read().await;
         let mut list: Vec<PeerSummary> = map
@@ -449,16 +501,27 @@ impl CitadelRnsClient {
             .entry("accept-encoding".into())
             .or_insert_with(|| "gzip".into());
 
+        let effective_path = if path_and_query.is_empty() {
+            "/".to_string()
+        } else {
+            path_and_query.to_string()
+        };
+
+        // Lock 2: Sign every outbound request with this device's persistent Ed25519 Client Identity
+        self.client_identity.sign_request_headers(
+            &dest_hex,
+            method,
+            &effective_path,
+            &body,
+            &mut headers,
+        );
+
         let req_id_str = Uuid::new_v4().simple().to_string()[..12].to_string();
         let req_id = req_id_from_str(&req_id_str);
 
         let meta = RequestMeta {
             method: method.to_string(),
-            path: if path_and_query.is_empty() {
-                "/".to_string()
-            } else {
-                path_and_query.to_string()
-            },
+            path: effective_path,
             headers,
         };
 
