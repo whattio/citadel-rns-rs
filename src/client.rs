@@ -90,7 +90,7 @@ pub struct CitadelRnsClient {
     ifac: Option<Arc<IfacKey>>,
     ifac_fingerprint: Option<String>,
     rns_peers: Arc<RwLock<Vec<String>>>,
-    req_sem: Arc<tokio::sync::Semaphore>,
+    dest_sems: Arc<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>>,
     send_lock: Arc<Mutex<()>>,
 }
 
@@ -202,7 +202,7 @@ impl CitadelRnsClient {
             ifac,
             ifac_fingerprint: ifac_fp,
             rns_peers: Arc::new(RwLock::new(initial_peers)),
-            req_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            dest_sems: Arc::new(Mutex::new(HashMap::new())),
             send_lock: Arc::new(Mutex::new(())),
         });
 
@@ -702,10 +702,17 @@ impl CitadelRnsClient {
         };
 
         let head_pkts = encode_json_chunks(PacketKind::ReqHead, req_id, &meta)?;
-        // Limit concurrent in-flight requests to 3 (<=9 request packets) so parallel SPA
-        // modulepreloads never overflow upstream Reticulum-rs's 16-slot in_link_events ring buffer.
-        let _req_permit = self
-            .req_sem
+        // Limit concurrent in-flight requests to 3 PER destination (<=9 request packets) so parallel SPA
+        // modulepreloads never overflow upstream Reticulum-rs's 16-slot in_link_events ring buffer,
+        // while a large 3D model download on one vault never blocks clicks to other vaults.
+        let dest_sem = {
+            let mut map = self.dest_sems.lock().await;
+            Arc::clone(
+                map.entry(dest_hex.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(3))),
+            )
+        };
+        let _req_permit = dest_sem
             .acquire()
             .await
             .map_err(|_| anyhow!("Reticulum client shutting down"))?;
