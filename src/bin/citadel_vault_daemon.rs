@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -85,6 +85,7 @@ struct InboundRequest {
 
 const MAX_RAM_CACHE_BYTES: usize = 48 * 1024 * 1024; // 48 MB pre-compressed static asset RAM cache
 const MAX_SINGLE_RAM_ASSET: usize = 12 * 1024 * 1024; // 12 MB max single RAM-cached asset
+const LARGE_STREAM_THRESHOLD: usize = 128 * 1024; // Serialize >128 KB responses so 3D models finish cleanly instead of starving each other
 const RAM_CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_CONSECUTIVE_ACK_TIMEOUTS: u32 = 6; // Abort dead/abandoned streams in ~1.5s instead of 3 min
 
@@ -277,7 +278,15 @@ fn is_static_immutable_path(path: &str) -> bool {
 
 fn is_compressible(ct: &str, path: &str) -> bool {
     let ct_l = ct.to_lowercase();
-    if ct_l.contains("text/event-stream") || ct_l.contains("multipart/") {
+    if ct_l.contains("text/event-stream") || ct_l.contains("multipart/") || ct_l.contains("gltf-binary") {
+        return false;
+    }
+    let clean = path.split('?').next().unwrap_or(path).to_lowercase();
+    // Never waste CPU gzipping already-compressed binary 3D/media containers (.glb, .png, .jpg, .webp, .woff2)
+    if matches!(
+        clean.rsplit('.').next().unwrap_or(""),
+        "glb" | "png" | "jpg" | "jpeg" | "webp" | "woff2" | "mp4" | "mp3" | "zip" | "gz" | "br"
+    ) {
         return false;
     }
     if ct_l.contains("text/")
@@ -285,16 +294,14 @@ fn is_compressible(ct: &str, path: &str) -> bool {
         || ct_l.contains("json")
         || ct_l.contains("svg")
         || ct_l.contains("wasm")
-        || ct_l.contains("gltf-binary")
         || ct_l.contains("xml")
         || ct_l.contains("model/")
     {
         return true;
     }
-    let clean = path.split('?').next().unwrap_or(path).to_lowercase();
     matches!(
         clean.rsplit('.').next().unwrap_or(""),
-        "obj" | "gltf" | "glb" | "stl" | "ply" | "mtl" | "js" | "mjs" | "css" | "json" | "svg" | "wasm" | "xml" | "txt"
+        "obj" | "gltf" | "stl" | "ply" | "mtl" | "js" | "mjs" | "css" | "json" | "svg" | "wasm" | "xml" | "txt"
     )
 }
 
@@ -307,7 +314,13 @@ async fn stream_buffered_response(
     transport: &Transport,
     dest_hash: &reticulum::hash::AddressHash,
     gate: &SendGate,
+    large_sem: &Semaphore,
 ) -> (u32, bool) {
+    let _large_guard = if wire_bytes.len() > LARGE_STREAM_THRESHOLD {
+        large_sem.acquire().await.ok()
+    } else {
+        None
+    };
     let rmeta = ResponseMeta { status, headers };
     if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
         for pkt in head_pkts {
@@ -377,6 +390,7 @@ async fn dispatch_request(
     gate: Arc<SendGate>,
     auth_policy: Arc<AuthPolicy>,
     ram_cache: Arc<Mutex<StaticRamCache>>,
+    large_sem: Arc<Semaphore>,
 ) {
     let mut head_bytes = Vec::new();
     for (_, part) in req.head_chunks {
@@ -493,6 +507,7 @@ async fn dispatch_request(
                 &transport,
                 &dest_hash,
                 &gate,
+                &large_sem,
             )
             .await;
             if !aborted {
@@ -606,11 +621,8 @@ async fn dispatch_request(
                     }
                 };
                 let orig_len = raw_body.len();
-                let comp_level = if is_static_asset {
-                    Compression::default()
-                } else {
-                    Compression::fast()
-                };
+                // Compression::fast() gives ~3.6x shrinkage on ASCII .obj/JS/CSS in ~0.2s even on ARMv7 edge nodes
+                let comp_level = Compression::fast();
                 let (wire_bytes, was_compressed): (Vec<u8>, bool) = if orig_len >= 512 {
                     let raw_vec = raw_body.to_vec();
                     let gz_res = if orig_len >= 64 * 1024 {
@@ -671,6 +683,7 @@ async fn dispatch_request(
                     &transport,
                     &dest_hash,
                     &gate,
+                    &large_sem,
                 )
                 .await;
                 if !aborted {
@@ -716,6 +729,7 @@ async fn dispatch_request(
                     &transport,
                     &dest_hash,
                     &gate,
+                    &large_sem,
                 )
                 .await;
                 if !aborted {
@@ -861,6 +875,7 @@ async fn main() -> Result<()> {
     let transport = Arc::new(transport);
     let gate = Arc::new(SendGate::new());
     let ram_cache = Arc::new(Mutex::new(StaticRamCache::default()));
+    let large_sem = Arc::new(Semaphore::new(1));
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .build()?;
@@ -937,6 +952,7 @@ async fn main() -> Result<()> {
                                     Arc::clone(&gate),
                                     Arc::clone(&auth_policy),
                                     Arc::clone(&ram_cache),
+                                    Arc::clone(&large_sem),
                                 ));
                             }
                             _ => {}
