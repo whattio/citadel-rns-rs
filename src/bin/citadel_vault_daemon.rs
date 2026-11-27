@@ -26,8 +26,9 @@ use reticulum::transport::{TimerConfig, Transport, TransportConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
@@ -82,11 +83,80 @@ struct InboundRequest {
     body_chunks: BTreeMap<u32, Vec<u8>>,
 }
 
+const MAX_RAM_CACHE_BYTES: usize = 48 * 1024 * 1024; // 48 MB pre-compressed static asset RAM cache
+const MAX_SINGLE_RAM_ASSET: usize = 12 * 1024 * 1024; // 12 MB max single RAM-cached asset
+const RAM_CACHE_TTL: Duration = Duration::from_secs(600);
+const MAX_CONSECUTIVE_ACK_TIMEOUTS: u32 = 6; // Abort dead/abandoned streams in ~1.5s instead of 3 min
+
+#[derive(Clone)]
+struct CachedStatic {
+    status: u16,
+    headers: Vec<(String, String)>,
+    wire_bytes: Arc<Vec<u8>>,
+    orig_len: usize,
+    inserted_at: Instant,
+}
+
+#[derive(Default)]
+struct StaticRamCache {
+    entries: HashMap<String, CachedStatic>,
+    total_bytes: usize,
+}
+
+impl StaticRamCache {
+    fn get(&mut self, key: &str) -> Option<CachedStatic> {
+        if let Some(entry) = self.entries.get(key) {
+            if entry.inserted_at.elapsed() <= RAM_CACHE_TTL {
+                return Some(entry.clone());
+            }
+        }
+        if let Some(expired) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(expired.wire_bytes.len());
+        }
+        None
+    }
+
+    fn insert(&mut self, key: String, val: CachedStatic) {
+        let new_len = val.wire_bytes.len();
+        if new_len == 0 || new_len > MAX_SINGLE_RAM_ASSET {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.wire_bytes.len());
+        }
+        while self.total_bytes + new_len > MAX_RAM_CACHE_BYTES {
+            let oldest_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.inserted_at)
+                .map(|(k, _)| k.clone());
+            match oldest_key {
+                Some(k) => {
+                    if let Some(evicted) = self.entries.remove(&k) {
+                        self.total_bytes = self.total_bytes.saturating_sub(evicted.wire_bytes.len());
+                    }
+                }
+                None => break,
+            }
+        }
+        self.total_bytes += new_len;
+        self.entries.insert(key, val);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkSendStatus {
+    Ok,
+    AckTimeout,
+    NoActiveLinks,
+}
+
 struct SendGate {
     /// Serializes all outbound RNS packets and tracks global in-flight chunk count
     /// in lockstep with the Airlock's global rx_window.
     window: Mutex<u32>,
     ack_notify: Notify,
+    active_links: AtomicUsize,
 }
 
 impl SendGate {
@@ -94,6 +164,7 @@ impl SendGate {
         Self {
             window: Mutex::new(0),
             ack_notify: Notify::new(),
+            active_links: AtomicUsize::new(0),
         }
     }
 
@@ -101,8 +172,22 @@ impl SendGate {
         self.ack_notify.notify_waiters();
     }
 
-    async fn reset_window(&self) {
+    async fn on_link_activated(&self) {
+        self.active_links.fetch_add(1, Ordering::Relaxed);
         *self.window.lock().await = 0;
+        self.ack_notify.notify_waiters();
+    }
+
+    async fn on_link_closed(&self) {
+        let _ = self.active_links.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+        *self.window.lock().await = 0;
+        self.ack_notify.notify_waiters();
+    }
+
+    fn has_active_links(&self) -> bool {
+        self.active_links.load(Ordering::Relaxed) > 0
     }
 
     async fn send_control(
@@ -120,7 +205,10 @@ impl SendGate {
         transport: &Transport,
         dest_hash: &reticulum::hash::AddressHash,
         pkt: &[u8],
-    ) {
+    ) -> ChunkSendStatus {
+        if !self.has_active_links() {
+            return ChunkSendStatus::NoActiveLinks;
+        }
         let mut wc = self.window.lock().await;
         *wc += 1;
         if *wc >= WINDOW_SIZE {
@@ -128,25 +216,127 @@ impl SendGate {
             tokio::pin!(notified);
             notified.as_mut().enable();
             transport.send_to_in_links(dest_hash, pkt).await;
-            let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
+            let res = tokio::time::timeout(Duration::from_millis(250), notified).await;
             *wc = 0;
+            if !self.has_active_links() {
+                return ChunkSendStatus::NoActiveLinks;
+            }
+            if res.is_err() {
+                return ChunkSendStatus::AckTimeout;
+            }
         } else {
             transport.send_to_in_links(dest_hash, pkt).await;
         }
+        ChunkSendStatus::Ok
     }
 }
 
-fn is_compressible_content_type(ct: &str) -> bool {
+fn is_static_immutable_path(path: &str) -> bool {
+    let clean = path.split('?').next().unwrap_or(path);
+    let low = clean.to_lowercase();
+    if low == "/"
+        || low.ends_with(".html")
+        || low.starts_with("/api/")
+        || low.contains("/api/")
+        || low.starts_with("/dpp/")
+        || low.starts_with("/cam/")
+    {
+        return false;
+    }
+    if low.starts_with("/assets/")
+        || low.starts_with("/_next/static/")
+        || low.starts_with("/models/")
+        || low.starts_with("/icons/")
+        || low.starts_with("/images/")
+        || low.starts_with("/fonts/")
+    {
+        return true;
+    }
+    matches!(
+        low.rsplit('.').next().unwrap_or(""),
+        "js" | "mjs"
+            | "css"
+            | "glb"
+            | "gltf"
+            | "obj"
+            | "stl"
+            | "wasm"
+            | "woff2"
+            | "woff"
+            | "ttf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "webp"
+            | "svg"
+            | "ico"
+            | "mp3"
+            | "wav"
+    )
+}
+
+fn is_compressible(ct: &str, path: &str) -> bool {
     let ct_l = ct.to_lowercase();
     if ct_l.contains("text/event-stream") || ct_l.contains("multipart/") {
         return false;
     }
-    ct_l.contains("text/")
+    if ct_l.contains("text/")
         || ct_l.contains("javascript")
         || ct_l.contains("json")
         || ct_l.contains("svg")
         || ct_l.contains("wasm")
         || ct_l.contains("gltf-binary")
+        || ct_l.contains("xml")
+        || ct_l.contains("model/")
+    {
+        return true;
+    }
+    let clean = path.split('?').next().unwrap_or(path).to_lowercase();
+    matches!(
+        clean.rsplit('.').next().unwrap_or(""),
+        "obj" | "gltf" | "glb" | "stl" | "ply" | "mtl" | "js" | "mjs" | "css" | "json" | "svg" | "wasm" | "xml" | "txt"
+    )
+}
+
+async fn stream_buffered_response(
+    req_id: [u8; 12],
+    rid_str: &str,
+    status: u16,
+    headers: Vec<(String, String)>,
+    wire_bytes: &[u8],
+    transport: &Transport,
+    dest_hash: &reticulum::hash::AddressHash,
+    gate: &SendGate,
+) -> (u32, bool) {
+    let rmeta = ResponseMeta { status, headers };
+    if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
+        for pkt in head_pkts {
+            gate.send_control(transport, dest_hash, &pkt).await;
+        }
+    }
+    let mut seq: u32 = 0;
+    let mut consecutive_timeouts: u32 = 0;
+    for slice in wire_bytes.chunks(MAX_CHUNK) {
+        let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
+        match gate.send_chunk(transport, dest_hash, &pkt).await {
+            ChunkSendStatus::Ok => consecutive_timeouts = 0,
+            ChunkSendStatus::AckTimeout => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= MAX_CONSECUTIVE_ACK_TIMEOUTS {
+                    warn!(req_id = %rid_str, chunks_sent = seq, "Receiver unresponsive (6 WindowAck timeouts) — aborting dead stream");
+                    return (seq, true);
+                }
+            }
+            ChunkSendStatus::NoActiveLinks => {
+                warn!(req_id = %rid_str, chunks_sent = seq, "All links closed mid-transfer — aborting stream");
+                return (seq, true);
+            }
+        }
+        seq = seq.wrapping_add(1);
+    }
+    let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
+    gate.send_control(transport, dest_hash, &end_pkt).await;
+    (seq, false)
 }
 
 async fn send_static_response(
@@ -186,6 +376,7 @@ async fn dispatch_request(
     dest_hash: reticulum::hash::AddressHash,
     gate: Arc<SendGate>,
     auth_policy: Arc<AuthPolicy>,
+    ram_cache: Arc<Mutex<StaticRamCache>>,
 ) {
     let mut head_bytes = Vec::new();
     for (_, part) in req.head_chunks {
@@ -274,13 +465,49 @@ async fn dispatch_request(
         }
     }
 
+    let is_get_req = meta.method.eq_ignore_ascii_case("GET");
     let is_head_req = meta.method.eq_ignore_ascii_case("HEAD");
+    let is_static_asset = is_static_immutable_path(&meta.path);
     let client_accepts_gzip = meta
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
         .map(|(_, v)| v.to_lowercase().contains("gzip"))
         .unwrap_or(false);
+
+    // Fast path: 0.01 ms in-RAM pre-compressed static asset cache (Vite bundles, 3D room twins, icons)
+    let ram_key = if is_get_req && is_static_asset {
+        Some(format!("{}|gz={}", meta.path, client_accepts_gzip))
+    } else {
+        None
+    };
+    if let Some(ref key) = ram_key {
+        let hit = { ram_cache.lock().await.get(key) };
+        if let Some(cached) = hit {
+            let (chunks, aborted) = stream_buffered_response(
+                req_id,
+                &rid_str,
+                cached.status,
+                cached.headers,
+                &cached.wire_bytes,
+                &transport,
+                &dest_hash,
+                &gate,
+            )
+            .await;
+            if !aborted {
+                info!(
+                    req_id = %rid_str,
+                    path = %meta.path,
+                    orig_bytes = cached.orig_len,
+                    wire_bytes = cached.wire_bytes.len(),
+                    chunks = chunks,
+                    "Streamed RAM-cached encrypted RNS response"
+                );
+            }
+            return;
+        }
+    }
 
     info!(
         req_id = %rid_str,
@@ -366,7 +593,9 @@ async fn dispatch_request(
                 && !is_head_req
                 && client_accepts_gzip
                 && !has_content_encoding
-                && is_compressible_content_type(&content_type);
+                && is_compressible(&content_type, &meta.path);
+
+            let should_buffer_static = status == 200 && is_get_req && is_static_asset && !should_gzip;
 
             if should_gzip {
                 let raw_body = match resp.bytes().await {
@@ -377,50 +606,121 @@ async fn dispatch_request(
                     }
                 };
                 let orig_len = raw_body.len();
-                let wire_bytes: Vec<u8> = if orig_len >= 512 {
-                    let mut enc = GzEncoder::new(Vec::with_capacity(orig_len / 3), Compression::fast());
-                    if enc.write_all(&raw_body).is_ok() {
-                        match enc.finish() {
-                            Ok(gz) if gz.len() < orig_len => {
-                                resp_headers.push(("content-encoding".into(), "gzip".into()));
-                                gz
-                            }
-                            _ => raw_body.to_vec(),
-                        }
-                    } else {
-                        raw_body.to_vec()
-                    }
+                let comp_level = if is_static_asset {
+                    Compression::default()
                 } else {
-                    raw_body.to_vec()
+                    Compression::fast()
                 };
+                let (wire_bytes, was_compressed): (Vec<u8>, bool) = if orig_len >= 512 {
+                    let raw_vec = raw_body.to_vec();
+                    let gz_res = if orig_len >= 64 * 1024 {
+                        tokio::task::spawn_blocking(move || {
+                            let mut enc = GzEncoder::new(Vec::with_capacity(orig_len / 3), comp_level);
+                            if enc.write_all(&raw_vec).is_ok() {
+                                match enc.finish() {
+                                    Ok(gz) if gz.len() < orig_len => (gz, true),
+                                    _ => (raw_vec, false),
+                                }
+                            } else {
+                                (raw_vec, false)
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| (raw_body.to_vec(), false))
+                    } else {
+                        let mut enc = GzEncoder::new(Vec::with_capacity(orig_len / 3), comp_level);
+                        if enc.write_all(&raw_vec).is_ok() {
+                            match enc.finish() {
+                                Ok(gz) if gz.len() < orig_len => (gz, true),
+                                _ => (raw_vec, false),
+                            }
+                        } else {
+                            (raw_vec, false)
+                        }
+                    };
+                    gz_res
+                } else {
+                    (raw_body.to_vec(), false)
+                };
+                if was_compressed {
+                    resp_headers.push(("content-encoding".into(), "gzip".into()));
+                }
 
-                let rmeta = ResponseMeta {
-                    status,
-                    headers: resp_headers,
-                };
-                if let Ok(head_pkts) = encode_json_chunks(PacketKind::RespHead, req_id, &rmeta) {
-                    for pkt in head_pkts {
-                        gate.send_control(&transport, &dest_hash, &pkt).await;
+                let wire_arc = Arc::new(wire_bytes);
+                if let Some(ref key) = ram_key {
+                    if wire_arc.len() <= MAX_SINGLE_RAM_ASSET {
+                        ram_cache.lock().await.insert(
+                            key.clone(),
+                            CachedStatic {
+                                status,
+                                headers: resp_headers.clone(),
+                                wire_bytes: Arc::clone(&wire_arc),
+                                orig_len,
+                                inserted_at: Instant::now(),
+                            },
+                        );
                     }
                 }
 
-                let mut seq: u32 = 0;
-                for slice in wire_bytes.chunks(MAX_CHUNK) {
-                    let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
-                    gate.send_chunk(&transport, &dest_hash, &pkt).await;
-                    seq = seq.wrapping_add(1);
+                let (chunks, aborted) = stream_buffered_response(
+                    req_id,
+                    &rid_str,
+                    status,
+                    resp_headers,
+                    &wire_arc,
+                    &transport,
+                    &dest_hash,
+                    &gate,
+                )
+                .await;
+                if !aborted {
+                    info!(
+                        req_id = %rid_str,
+                        status = status,
+                        orig_bytes = orig_len,
+                        wire_bytes = wire_arc.len(),
+                        chunks = chunks,
+                        "Streamed compressed encrypted RNS response"
+                    );
                 }
-
-                let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
-                gate.send_control(&transport, &dest_hash, &end_pkt).await;
-                info!(
-                    req_id = %rid_str,
-                    status = status,
-                    orig_bytes = orig_len,
-                    wire_bytes = wire_bytes.len(),
-                    chunks = seq,
-                    "Streamed compressed encrypted RNS response"
-                );
+            } else if should_buffer_static {
+                let raw_body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(req_id = %rid_str, "Failed reading static upstream body: {e}");
+                        return;
+                    }
+                };
+                let orig_len = raw_body.len();
+                let wire_arc = Arc::new(raw_body.to_vec());
+                if let Some(ref key) = ram_key {
+                    if wire_arc.len() <= MAX_SINGLE_RAM_ASSET {
+                        ram_cache.lock().await.insert(
+                            key.clone(),
+                            CachedStatic {
+                                status,
+                                headers: resp_headers.clone(),
+                                wire_bytes: Arc::clone(&wire_arc),
+                                orig_len,
+                                inserted_at: Instant::now(),
+                            },
+                        );
+                    }
+                }
+                let (chunks, aborted) = stream_buffered_response(
+                    req_id,
+                    &rid_str,
+                    status,
+                    resp_headers,
+                    &wire_arc,
+                    &transport,
+                    &dest_hash,
+                    &gate,
+                )
+                .await;
+                if !aborted {
+                    info!(req_id = %rid_str, status = status, chunks = chunks, bytes = orig_len, "Streamed static encrypted RNS response");
+                }
             } else {
                 let rmeta = ResponseMeta {
                     status,
@@ -434,20 +734,39 @@ async fn dispatch_request(
 
                 let mut seq: u32 = 0;
                 let mut total_bytes: usize = 0;
+                let mut consecutive_timeouts: u32 = 0;
+                let mut aborted = false;
                 if !is_head_req {
-                    while let Ok(Some(chunk)) = resp.chunk().await {
+                    'stream: while let Ok(Some(chunk)) = resp.chunk().await {
                         for slice in chunk.chunks(MAX_CHUNK) {
                             let pkt = encode_packet(PacketKind::RespChunk, req_id, seq, slice);
-                            gate.send_chunk(&transport, &dest_hash, &pkt).await;
+                            match gate.send_chunk(&transport, &dest_hash, &pkt).await {
+                                ChunkSendStatus::Ok => consecutive_timeouts = 0,
+                                ChunkSendStatus::AckTimeout => {
+                                    consecutive_timeouts += 1;
+                                    if consecutive_timeouts >= MAX_CONSECUTIVE_ACK_TIMEOUTS {
+                                        warn!(req_id = %rid_str, chunks_sent = seq, "Receiver unresponsive (6 WindowAck timeouts) — aborting live stream");
+                                        aborted = true;
+                                        break 'stream;
+                                    }
+                                }
+                                ChunkSendStatus::NoActiveLinks => {
+                                    warn!(req_id = %rid_str, chunks_sent = seq, "All links closed mid-stream — aborting");
+                                    aborted = true;
+                                    break 'stream;
+                                }
+                            }
                             seq = seq.wrapping_add(1);
                             total_bytes += slice.len();
                         }
                     }
                 }
 
-                let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
-                gate.send_control(&transport, &dest_hash, &end_pkt).await;
-                info!(req_id = %rid_str, status = status, chunks = seq, bytes = total_bytes, "Streamed lossless encrypted RNS response");
+                if !aborted {
+                    let end_pkt = encode_packet(PacketKind::RespEnd, req_id, seq, &[]);
+                    gate.send_control(&transport, &dest_hash, &end_pkt).await;
+                    info!(req_id = %rid_str, status = status, chunks = seq, bytes = total_bytes, "Streamed lossless encrypted RNS response");
+                }
             }
         }
         Err(e) => {
@@ -541,6 +860,7 @@ async fn main() -> Result<()> {
 
     let transport = Arc::new(transport);
     let gate = Arc::new(SendGate::new());
+    let ram_cache = Arc::new(Mutex::new(StaticRamCache::default()));
     let http_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .build()?;
@@ -578,11 +898,11 @@ async fn main() -> Result<()> {
                 };
                 match link_ev.event {
                     LinkEvent::Activated => {
-                        gate.reset_window().await;
+                        gate.on_link_activated().await;
                         info!(link_id = %link_ev.id, "Encrypted X25519+Ed25519 Reticulum link ACTIVATED");
                     }
                     LinkEvent::Closed => {
-                        gate.reset_window().await;
+                        gate.on_link_closed().await;
                         info!(link_id = %link_ev.id, "Reticulum link closed");
                     }
                     LinkEvent::Data(payload) => {
@@ -616,6 +936,7 @@ async fn main() -> Result<()> {
                                     dest_hash,
                                     Arc::clone(&gate),
                                     Arc::clone(&auth_policy),
+                                    Arc::clone(&ram_cache),
                                 ));
                             }
                             _ => {}
