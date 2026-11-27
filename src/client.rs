@@ -425,12 +425,29 @@ impl CitadelRnsClient {
                                     }
                                 }
                                 PacketKind::RespEnd => {
+                                    let expected_chunks = pkt.seq as usize;
                                     let finished = pending.lock().await.remove(&pkt.req_id);
                                     if let Some(mut entry) = finished {
                                         // Offload gzip decompression & response assembly to a spawned task
                                         // so the 16-slot Reticulum out_link_events receiver NEVER lags!
                                         let peers_bg = Arc::clone(&peers);
                                         tokio::spawn(async move {
+                                            if entry.body_chunks.len() != expected_chunks {
+                                                warn!(
+                                                    dest_hash = %entry.dest_hash,
+                                                    got_chunks = entry.body_chunks.len(),
+                                                    expected_chunks = expected_chunks,
+                                                    "Incomplete CHT2 stream (dropped chunk) — rejecting corrupt response"
+                                                );
+                                                if let Some(tx) = entry.done_tx.take() {
+                                                    let _ = tx.send(Err(anyhow!(
+                                                        "Incomplete CHT2 stream ({}/{} chunks received)",
+                                                        entry.body_chunks.len(),
+                                                        expected_chunks
+                                                    )));
+                                                }
+                                                return;
+                                            }
                                             let meta = entry.meta.unwrap_or(ResponseMeta {
                                                 status: 200,
                                                 headers: vec![("content-type".into(), "application/octet-stream".into())],
@@ -457,8 +474,14 @@ impl CitadelRnsClient {
                                                         .collect();
                                                     (out, cleaned)
                                                 } else {
-                                                    warn!(dest_hash = %entry.dest_hash, wire_bytes = entry.wire_bytes, "Gzip decode failed on CHT2 response");
-                                                    (raw_body, meta.headers)
+                                                    warn!(dest_hash = %entry.dest_hash, wire_bytes = entry.wire_bytes, "Gzip decode failed on CHT2 response — rejecting corrupt payload");
+                                                    if let Some(tx) = entry.done_tx.take() {
+                                                        let _ = tx.send(Err(anyhow!(
+                                                            "Corrupt/incomplete gzip CHT2 payload (wire_bytes={})",
+                                                            entry.wire_bytes
+                                                        )));
+                                                    }
+                                                    return;
                                                 }
                                             } else {
                                                 (raw_body, meta.headers)
@@ -756,6 +779,7 @@ impl CitadelRnsClient {
             }
             Err(_) => {
                 self.pending.lock().await.remove(&req_id);
+                // Mark link stale and immediately spawn a fresh X25519 re-link
                 let relink_info = {
                     let mut map = self.peers.write().await;
                     if let Some(rec) = map.get_mut(&dest_hex) {
