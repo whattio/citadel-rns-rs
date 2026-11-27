@@ -43,9 +43,9 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     upstream: String,
 
-    /// Reticulum TCP outbound peer address for 0-port Ghost mode (e.g. 127.0.0.1:14245)
-    #[arg(long)]
-    rns_peer: Option<String>,
+    /// Reticulum TCP outbound peer address(es) for 0-port Ghost mode (repeatable: local + WAN relay)
+    #[arg(long = "rns-peer")]
+    rns_peers: Vec<String>,
 
     /// Optional Reticulum TCP bind address (only used if --rns-peer is not set)
     #[arg(long, default_value = "0.0.0.0:14245")]
@@ -507,15 +507,17 @@ async fn main() -> Result<()> {
         dest_hash_hex,
     });
 
-    if let Some(ref peer) = args.rns_peer {
-        transport.iface_manager().lock().await.spawn(
-            FastTcpClient::new_with_ifac(peer, ifac.clone()),
-            FastTcpClient::spawn,
-        );
+    if !args.rns_peers.is_empty() {
+        for peer in &args.rns_peers {
+            transport.iface_manager().lock().await.spawn(
+                FastTcpClient::new_with_ifac(peer, ifac.clone()),
+                FastTcpClient::spawn,
+            );
+        }
         info!(
             dest_hash = %dest_hash,
             mode = "0-port-outbound",
-            peer = %peer,
+            peers = ?args.rns_peers,
             upstream = %args.upstream,
             ifac = ifac.as_ref().map(|k| k.fingerprint()).unwrap_or("off"),
             client_allowlist = auth_enforced,
