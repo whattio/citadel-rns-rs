@@ -90,6 +90,8 @@ pub struct CitadelRnsClient {
     ifac: Option<Arc<IfacKey>>,
     ifac_fingerprint: Option<String>,
     rns_peers: Arc<RwLock<Vec<String>>>,
+    req_sem: Arc<tokio::sync::Semaphore>,
+    send_lock: Arc<Mutex<()>>,
 }
 
 fn now_ts() -> u64 {
@@ -200,6 +202,8 @@ impl CitadelRnsClient {
             ifac,
             ifac_fingerprint: ifac_fp,
             rns_peers: Arc::new(RwLock::new(initial_peers)),
+            req_sem: Arc::new(tokio::sync::Semaphore::new(3)),
+            send_lock: Arc::new(Mutex::new(())),
         });
 
         // Task 1: Discover Vault announces, enforce optional hash allowlist, and establish X25519+Ed25519 Links
@@ -698,6 +702,14 @@ impl CitadelRnsClient {
         };
 
         let head_pkts = encode_json_chunks(PacketKind::ReqHead, req_id, &meta)?;
+        // Limit concurrent in-flight requests to 3 (<=9 request packets) so parallel SPA
+        // modulepreloads never overflow upstream Reticulum-rs's 16-slot in_link_events ring buffer.
+        let _req_permit = self
+            .req_sem
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("Reticulum client shutting down"))?;
+
         let (done_tx, done_rx) = oneshot::channel();
 
         self.pending.lock().await.insert(
@@ -713,17 +725,21 @@ impl CitadelRnsClient {
             },
         );
 
-        for pkt in head_pkts {
-            self.transport.send_to_out_links(&dest, &pkt).await;
+        {
+            let _send_guard = self.send_lock.lock().await;
+            for pkt in head_pkts {
+                self.transport.send_to_out_links(&dest, &pkt).await;
+            }
+            let mut seq: u32 = 0;
+            for slice in body.chunks(MAX_CHUNK) {
+                let pkt = encode_packet(PacketKind::ReqChunk, req_id, seq, slice);
+                self.transport.send_to_out_links(&dest, &pkt).await;
+                seq += 1;
+            }
+            let end_pkt = encode_packet(PacketKind::ReqEnd, req_id, seq, &[]);
+            self.transport.send_to_out_links(&dest, &end_pkt).await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
         }
-        let mut seq: u32 = 0;
-        for slice in body.chunks(MAX_CHUNK) {
-            let pkt = encode_packet(PacketKind::ReqChunk, req_id, seq, slice);
-            self.transport.send_to_out_links(&dest, &pkt).await;
-            seq += 1;
-        }
-        let end_pkt = encode_packet(PacketKind::ReqEnd, req_id, seq, &[]);
-        self.transport.send_to_out_links(&dest, &end_pkt).await;
 
         match tokio::time::timeout(timeout, done_rx).await {
             Ok(Ok(res)) => res,
